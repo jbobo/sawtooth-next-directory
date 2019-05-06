@@ -73,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     "-c"|"--persist"    ) PERSIST=1;;
     "-d"|"--dev"        ) DEV=1;;
     "-p"|"--prod"       ) PROD=1;;
+    "-q"|"--quiet"      ) QUIET=1;;
     *                   ) echo "ERROR: Invalid option: \""$opt"\"" >&2
                             usage
                             exit 1;;
@@ -95,6 +96,8 @@ if [[ "$PROD" == "1" ]]; then
 else
     CMD="$CMD -f docker-compose.override.yaml"
 fi
+if [["$QUIET" == 1]]; then
+    CMD = "$CMD --log-level ERROR"
 CMD="$CMD up"
 if [[ "$BUILD" == "1" ]]; then
     CMD="$CMD --build"

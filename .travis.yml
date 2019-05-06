@@ -1,20 +1,53 @@
 jobs:
   include:
-    - stage: backend
+    - stage: Tests
+      name: Backend - Formatter
       language: python
-      python:
-        - "3.6"
-      before_install:
-        - sudo apt-get install automake
-        - sudo apt-get install libtool
-        - sudo apt-get install pkg-config
-      install:
-        - pip3 install -r requirements.txt
+      python: "3.6"
       script:
         - bin/run_python_formatter_check
+
+    - stage: Tests
+      name: Backend - Linter
+      language: python
+      python: "3.6"
+      script:
         - bin/run_lint
-        - bin/build -t
-    - stage: frontend
+
+    - stage: Tests
+      name: Backend - Integration Tests
+      language: python
+      python: "3.6"
+      script:
+        - "bin/build -t"
+      env:
+        - TEST_DIR=integration
+
+    - stage: Tests
+      name: Backend - Unit Tests
+      language: python
+      python: "3.6"
+      before_install:
+        - sudo apt-get -qq install automake libtool pkg-config
+      install:
+        - pip3 install --quiet -r requirements.txt
+      before_script:
+        - cp .env.example .env
+        - cd ./rbac
+      script:
+        - python -m pytest ../tests/unit
+
+    - stage: Tests
+      name: Backend - Blockchain Tests
+      language: python
+      python: "3.6"
+      script:
+        - "bin/build -t"
+      env: 
+        - TEST_DIR=blockchain
+
+    - stage: Tests
+      name: Frontend - Linter
       env:
         - NODE_PATH=src/
       language: node_js
@@ -30,6 +63,23 @@ jobs:
         - yarn
       script:
         - yarn lint
+
+    - stage: Tests
+      name: Frontend - Tests
+      env:
+        - NODE_PATH=src/
+      language: node_js
+      cache:
+        yarn: true
+        directories:
+          - node_modules
+      node_js:
+        - "lts/*"
+      before_install:
+        - cd ./client
+      install:
+        - yarn
+      script:
         - yarn test
 
     # The deploy stage will deploy the master branch to a remote server once a

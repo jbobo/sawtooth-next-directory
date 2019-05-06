@@ -135,9 +135,10 @@ services:
     image: rbac-shell:${ISOLATION_ID-latest}
     volumes:
       - ".:/project/hyperledger-rbac"
-    command: pytest
     environment:
       - LOGGING_LEVEL=${LOGGING_LEVEL:-INFO}
       - PYTHONPATH=/project/hyperledger-rbac/
       - HOST=${HOST:-localhost}
       - LDAP_SERVER=${LDAP_SERVER}
+      - TEST_DIR=${TEST_DIR}
+    command: "pytest ./tests/${TEST_DIR}"
