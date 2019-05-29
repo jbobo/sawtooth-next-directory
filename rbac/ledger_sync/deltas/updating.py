@@ -49,7 +49,7 @@ def get_role(conn, role_id):
         )
         .without("role_id")
         .coerce_to("array")
-        .run(conn)
+        .run(conn, read_mode="majority")
     )
     return resource
 
@@ -79,7 +79,7 @@ def get_user(conn, next_id):
         )
         .without("next_id", "start_block_num", "end_block_num")
         .coerce_to("array")
-        .run(conn)
+        .run(conn, read_mode="majority")
     )
     return resource
 
@@ -183,21 +183,23 @@ def _update_legacy(conn, block_num, address, resource, data_type):
             **resource,
         }
 
-        query = (
-            r.table(TABLE_NAMES[data_type])
-            .get(address)
-            .replace(
-                lambda doc: r.branch(
-                    # pylint: disable=singleton-comparison
-                    (doc == None),  # noqa
-                    r.expr(data),
-                    doc.merge(resource),
-                )
-            )
+        r.table(TABLE_NAMES[data_type]).wait().run(conn)
+
+        query = r.table(TABLE_NAMES[data_type]).get(address).replace({**data})
+        result = query.run(conn, durability="hard")
+
+        # TODO: remove before prod
+        LOGGER.warning(
+            "Table: %s\n Resource: %s\n %s",
+            TABLE_NAMES[data_type],
+            resource,
+            result
         )
-        result = query.run(conn)
+
         if result["errors"] > 0:
             LOGGER.warning("error updating legacy state table:\n%s\n%s", result, query)
+
+        r.table(TABLE_NAMES[data_type]).sync().run(conn, read_mode="majority")
 
     except Exception as err:  # pylint: disable=broad-except
         LOGGER.warning("_update_legacy %s error:", type(err))
@@ -225,6 +227,7 @@ def _update_provider(conn, address_type, resource):
     if address_type in outbound_types:
         # Get the object & format it.
         if outbound_types[address_type] == "user":
+            r.table("users").wait().run(conn)
             user = get_user(conn, resource["next_id"])
             if user:
                 formatted_resource = user[0]
@@ -233,9 +236,21 @@ def _update_provider(conn, address_type, resource):
                 return
             data_type = "user"
         if outbound_types[address_type] == "role":
+            r.table("roles").wait().run(conn)
+            r.table("roles").sync().run(conn)
+            role_exists = (
+                r.table("roles")
+                .filter({"role_id": resource["role_id"]})
+                .count()
+                .run(conn, read_mode="majority")
+            )
             role = get_role(conn, resource["role_id"])
-            if role:
-                formatted_resource = role[0]
+            if role_exists == 1:
+                if role:
+                    formatted_resource = role[0]
+                else:
+                    LOGGER.warning("Role relations not found: %s", role)
+                    return
             else:
                 LOGGER.warning("Role not found: %s", resource["role_id"])
                 return
@@ -250,10 +265,10 @@ def _update_provider(conn, address_type, resource):
                 "timestamp": r.now(),
                 "provider_id": LDAP_DC,
             }
-            r.table("outbound_queue").insert(outbound_entry, return_changes=True).run(
+            result = r.table("outbound_queue").insert(outbound_entry, return_changes=True).run(
                 conn
             )
-            return
+            return result
 
 
 def _update(conn, block_num, address, resource):
@@ -262,9 +277,10 @@ def _update(conn, block_num, address, resource):
     data_type = addresser.get_address_type(address)
     pre_filter(resource)
 
+    _update_state(conn, block_num, address, resource)
+
     if data_type in TABLE_NAMES:
         _update_legacy(conn, block_num, address, resource, data_type)
-        _update_state(conn, block_num, address, resource)
         _update_provider(conn, data_type, resource)
 
 

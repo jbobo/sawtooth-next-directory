@@ -14,6 +14,8 @@
 # ------------------------------------------------------------------------------
 """Proposals APIs."""
 
+import rethinkdb as r
+
 from sanic import Blueprint
 from sanic.response import json
 
@@ -139,6 +141,10 @@ async def update_proposal(request, proposal_id):
     LOGGER.debug("update proposal %s\n%s", proposal_id, request.json)
     required_fields = ["reason", "status"]
     utils.validate_fields(required_fields, request.json)
+
+    await r.table("proposals").sync().run(request.app.config.DB_CONN)
+    await r.table("proposals").wait().run(request.app.config.DB_CONN)
+
     if request.json["status"] not in ("REJECTED", "APPROVED"):
         raise ApiBadRequest(
             "Bad Request: status must be either 'REJECTED' or 'APPROVED'"

@@ -63,6 +63,7 @@ async def create_new_role(request):
     """Create a new role."""
     required_fields = ["name", "administrators", "owners"]
     utils.validate_fields(required_fields, request.json)
+    await r.table("roles").wait().run(request.app.config.DB_CONN)
     role_title = " ".join(request.json.get("name").split())
     response = await roles_query.roles_search_duplicate(
         request.app.config.DB_CONN, role_title
@@ -105,13 +106,14 @@ async def create_new_role(request):
                 "provider_id": LDAP_DC,
             }
             # Insert to outbound_queue and close
-            role_outbound_resource = await roles_query.insert_to_outboundqueue(
+            await roles_query.insert_to_outboundqueue(
                 request.app.config.DB_CONN, outbound_entry
             )
         else:
             LOGGER.info(
                 "The role being created is NextAdmins, which is local to NEXT and will not be inserted into the outbound_queue."
             )
+        await r.table("roles").sync().run(request.app.config.DB_CONN)
         return create_role_response(request, role_id)
     raise ApiBadRequest(
         "Error: Could not create this role because the role name already exists."
@@ -200,6 +202,7 @@ async def add_role_member(request, role_id):
     approver = await fetch_relationships("role_owners", "role_id", role_id).run(
         request.app.config.DB_CONN
     )
+    LOGGER.info("••• Approver: %s", approver)
     batch_list = Role().member.propose.batch_list(
         signer_keypair=txn_key,
         signer_user_id=txn_user_id,
@@ -217,12 +220,20 @@ async def add_role_member(request, role_id):
         request.app.config.TIMEOUT,
         request.json.get("tracker") and True,
     )
+    await r.table("roles").sync().run(request.app.config.DB_CONN)
+    await r.table("roles").wait().run(request.app.config.DB_CONN)
+    await r.table("role_owners").sync().run(request.app.config.DB_CONN)
+    await r.table("role_owners").wait().run(request.app.config.DB_CONN)
     role_resource = await roles_query.fetch_role_resource(
         request.app.config.DB_CONN, role_id
     )
+    LOGGER.info("••• Role Resource: %s", role_resource)
     owners = role_resource.get("owners")
     requester_id = request.json.get("id")
     if requester_id in owners:
+        LOGGER.warn("••• Autoapproving request")
+        await r.table("proposals").sync().run(request.app.config.DB_CONN)
+        await r.table("proposals").wait().run(request.app.config.DB_CONN)
         request.json["status"] = "APPROVED"
         request.json["reason"] = "I am the owner of this role"
         await proposals.update_proposal(request, proposal_id)

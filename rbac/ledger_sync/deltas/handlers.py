@@ -39,6 +39,7 @@ def update_database(conn, state_change):
     """
     update = get_updater(conn, state_change.block_num)
     remove = get_remover(conn)
+    # TODO: FIXME: sort the changes so that roles are processed before role relations.
     for change in state_change.state_changes:
         if addresser.family.is_family(change.address):
             if not change.value:

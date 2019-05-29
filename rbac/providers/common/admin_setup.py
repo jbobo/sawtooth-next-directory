@@ -40,7 +40,7 @@ def add_admin_accounts():
         }
         response = session.post("http://rbac-server:8000/api/users", json=admin_user)
         if response.status_code >= 300:
-            LOGGER.warning("There was an issue with creating Admin user.")
+            LOGGER.warning("There was an issue with creating Admin user. \n%s", response.json())
             return
 
         LOGGER.warning("Creating NextAdmin role...")
@@ -54,8 +54,12 @@ def add_admin_accounts():
         role_response = session.post(
             "http://rbac-server:8000/api/roles", json=admin_role
         )
+
+        # TODO: remove before prod
+        LOGGER.info("AdminRole: %s", role_response.json())
+
         if role_response.status_code >= 300:
-            LOGGER.warning("There was an issue with creating Admin Role.")
+            LOGGER.warning("There was an issue with creating Admin Role.\n%s", role_response.json())
             return
 
         LOGGER.warning("Adding Next Admin to NextAdmins role...")
@@ -67,13 +71,24 @@ def add_admin_accounts():
             "reason": None,
             "metadata": None,
         }
-        add_role_member_response = session.post(
-            ("http://rbac-server:8000/api/roles/{}/members".format(role_next_id)),
-            json=add_user,
-        )
-        if add_role_member_response.status_code >= 300:
-            LOGGER.warning(
-                "There was an issue with making the Admin a member of NextAdmins"
+
+        # TODO: remove before prod
+        # poll up to 4 times if the role is not in the db yet.
+        attempts = 4
+        delay = 1
+        i = 0
+        while i < attempts:
+            add_role_member_response = session.post(
+                ("http://rbac-server:8000/api/roles/{}/members".format(role_next_id)),
+                json=add_user,
             )
-            return
+            if add_role_member_response.status_code >= 300:
+                LOGGER.warning(
+                    "There was an issue with making the Admin a member of NextAdmins. \n%s",
+                    add_role_member_response.json(),
+                )
+                time.sleep(delay)
+            if add_role_member_response.status_code == 200:
+                i = 4
+            i += 1
         LOGGER.info("Next Admin account and role creation complete!")
