@@ -165,6 +165,11 @@ services:
   rethink:
     container_name: rbac-rethink
     image: rethinkdb:2.3
+    healthcheck:
+      test: python ./bin/rethink_healthcheck
+      interval: 30s
+      timeout: 10s
+      retries: 5
     ports:
       - "9090:8080"
     expose:
@@ -194,7 +199,7 @@ services:
     volumes:
       - ".:/project/hyperledger-rbac"
     depends_on:
-      - rethink-bootstrap-worker
+      - rethink
       - validator
     environment:
       - AES_KEY=${AES_KEY}
