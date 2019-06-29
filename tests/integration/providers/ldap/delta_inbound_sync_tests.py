@@ -40,6 +40,7 @@ from rbac.common.logs import get_default_logger
 from rbac.providers.ldap.delta_inbound_sync import (
     insert_updated_entries,
     insert_deleted_entries,
+    remove_outbound_duplicates,
 )
 from tests.utilities import (
     check_user_is_pack_owner,
@@ -81,6 +82,13 @@ TEST_USERS = [
 ]
 
 TEST_GROUPS = [{"common_name": "test_group", "name": "test_group"}]
+
+# entry_data, outbound_status, expected_result.
+TEST_CHECK_OUTBOUND_QUEUE = [
+    ({"data": {"name": "Test Entry 1"}}, "UNCONFIRMED", True),
+    ({"data": {"name": "Test Entry 2"}}, "CONFIRMED", True),
+    ({"data": {"name": "Test Entry 3"}}, None, False),
+]
 
 
 # ------------------------------------------------------------------------------
@@ -378,6 +386,21 @@ def get_fake_group(ldap_connection, group_common_name):
     }
     ldap_connection.search(**search_parameters)
     return ldap_connection.entries
+
+
+def put_in_outbound_queue(test_entry):
+    """Puts a fake ( user | group ) object in the outbound queue.
+    Args:
+        fake_data:
+            obj: a fake ( user | group ) object to insert.
+    Returns:
+        result:
+            obj: A rethinkdb insertion response.
+    """
+    conn = connect_to_db()
+    result = r.table("outbound_queue").insert(test_entry).coerce_to("object").run(conn)
+    conn.close()
+    return result
 
 
 def put_in_inbound_queue(fake_data, data_type):
@@ -950,3 +973,42 @@ def test_created_date_comparison(ldap_connection):
     time.sleep(2)
     ldap_role = get_role("pokemons")
     assert fake_group[0].whenCreated.value == ldap_role[0]["created_date"]
+
+
+@pytest.mark.parametrize(
+    "entry_data, outbound_status, expected_result", TEST_CHECK_OUTBOUND_QUEUE
+)
+def test_outbound_queue_check(entry_data, outbound_status, expected_result):
+    """ Tests that any inbound queue entries are checked against the outbound
+    queue before insertion. If a duplicate entry exists in the outbound queue
+    the function should return `True`, indicating the entry has already been
+    written to sawtooth and that both entries should be deleted. Otherwise,
+    the function should return `False`, indicating that the entry should be
+    inserted.
+
+    Args:
+        entry_data:
+            obj:    A dict containing a valid NEXT user or role object. Only
+                    the `whenChanged` key is directly called in this obj, so
+                    the rest may be arbitrary for this test (update if needed).
+        outbound_status:
+            str:    A string containing a valid NEXT `status` (
+                    `CONFIRMED` or `UNCONFIRMED`). May be an empty string.
+        expected_result:
+            bool:   The boolean value that is expected to be returned by
+                    put_in_outbound_queue().
+    """
+    with connect_to_db() as conn:
+        if expected_result:
+            outbound_entry = {**entry_data}
+            if outbound_status:
+                outbound_entry["status"] = outbound_status
+                result = (
+                    r.table("outbound_queue")
+                    .insert(outbound_entry)
+                    .coerce_to("object")
+                    .run(conn)
+                )
+                assert result["inserted"] > 0
+        result = remove_outbound_duplicates(entry_data, conn)
+        assert result == expected_result
