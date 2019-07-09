@@ -217,17 +217,19 @@ def insert_deleted_entries(deleted_entries, data_type):
     conn = connect_to_db()
     for remote_id in deleted_entries:
         data = {"remote_id": remote_id}
-        inbound_entry = {
-            "data": data,
-            "data_type": data_type,
-            "sync_type": "delta",
-            "timestamp": datetime.now().replace(tzinfo=timezone.utc).isoformat(),
-            "provider_id": LDAP_DC,
-        }
-        LOGGER.debug(
-            "Inserted deleted LDAP %s into inbound queue: %s", data_type, remote_id
-        )
-        r.table("inbound_queue").insert(inbound_entry).run(conn)
+        is_entry_a_duplicate = remove_outbound_duplicates(data, conn)
+        if not is_entry_a_duplicate:
+            inbound_entry = {
+                "data": data,
+                "data_type": data_type,
+                "sync_type": "delta",
+                "timestamp": datetime.now().replace(tzinfo=timezone.utc).isoformat(),
+                "provider_id": LDAP_DC,
+            }
+            LOGGER.debug(
+                "Inserted deleted LDAP %s into inbound queue: %s", data_type, remote_id
+            )
+            r.table("inbound_queue").insert(inbound_entry).run(conn)
     conn.close()
 
 
@@ -251,19 +253,22 @@ def insert_updated_entries(data_dict, when_changed, data_type):
                 "timestamp": entry_modified_timestamp,
                 "provider_id": LDAP_DC,
             }
-            LOGGER.debug(
-                "Inserting LDAP %s into inbound queue: %s",
-                data_type,
-                standardized_entry["remote_id"],
-            )
-            r.table("inbound_queue").insert(inbound_entry).run(conn)
 
-            sync_source = "ldap-" + data_type
-            provider_id = LDAP_DC
-            save_sync_time(
-                provider_id, sync_source, "delta", conn, entry_modified_timestamp
-            )
-            insertion_counter += 1
+            is_entry_a_duplicate = remove_outbound_duplicates(standardized_entry, conn)
+            if not is_entry_a_duplicate:
+                LOGGER.debug(
+                    "Inserting LDAP %s into inbound queue: %s",
+                    data_type,
+                    standardized_entry["remote_id"],
+                )
+                r.table("inbound_queue").insert(inbound_entry).run(conn)
+
+                sync_source = "ldap-" + data_type
+                provider_id = LDAP_DC
+                save_sync_time(
+                    provider_id, sync_source, "delta", conn, entry_modified_timestamp
+                )
+                insertion_counter += 1
     conn.close()
     LOGGER.info("Inserted %s records into inbound_queue.", insertion_counter)
 
@@ -284,3 +289,170 @@ def inbound_delta_sync():
         LOGGER.info(
             "LDAP Domain Controller is not provided, skipping LDAP delta syncs."
         )
+
+
+def remove_outbound_duplicates(entry_data, db_conn):
+    """Check outbound queue for matching `status: 'CONFIRMED'` entries
+    (indicates that we've ingested a change we recently pushed to provider)
+
+    Args:
+        entry_data:
+            obj:    data field of a valid NEXT object. This field will contain either a
+                    full NEXT user dict, or a full NEXT role dict.
+        db_conn:
+            obj: An open RethinkDB connection object.
+    Returns:
+        bool:
+            True: Matching entries were found and removed from the outbound queue.
+            False: No matching entries were found in hte outbound queue.
+    """
+    remote_id = entry_data["remote_id"]
+    outbound_duplicates = get_outbound_duplicates(remote_id, db_conn)
+
+    matching_entries = get_matching_entries(entry_data, outbound_duplicates)
+    LOGGER.info(
+        "Found %s matching entries in the outbound queue.", len(matching_entries)
+    )
+
+    if matching_entries:
+        LOGGER.info("Deleting matching entries from the outbound queue.")
+
+        update_response = set_status_to_confirmed(matching_entries, db_conn)
+        log_rethink_response(update_response, "updated")
+
+        delete_response = delete_outbound_entries(matching_entries, db_conn)
+        log_rethink_response(delete_response, "deleted")
+
+        return True
+
+    LOGGER.info("No matching entries found in outbound queue. Ignoring...")
+    return False
+
+
+def get_outbound_duplicates(remote_id, db_conn):
+    """Get all outbound_queue entries with the same remote_id.
+
+    Args:
+        remote_id:
+            str:    The remote id of the user|role object used by the
+                    remote rbac provider.
+        db_conn:
+            obj:    An open RethinkDB connection object.
+    Returns:
+        outbound_duplicates:
+            list:   A list of RethinkDB user|group entries from the
+                    outbound queue that have the given remote id.
+    """
+    outbound_duplicates = (
+        r.table("outbound_queue")
+        .filter({"data": {"remote_id": remote_id}})
+        .coerce_to("array")
+        .run(db_conn)
+    )
+    return outbound_duplicates
+
+
+def get_matching_entries(entry_data, outbound_duplicates):
+    """Loop through rbac entries to find if any have matching `data` fields.
+    A matching `data` field indicates that the entry represents the same
+    transaction performed on a resource.
+
+    Args:
+        entry_data:
+            obj:    A dict containing a user|role RethnkDB entry.
+        outbound_suplicates:
+            list:   A list of user|role entries from RethinkDB representing
+                    transactions performed on a single resource.
+    Returns:
+        matching_entries:
+            list:   A list of any user|role entries with a data field
+                    matching the given entry_data.
+    """
+    matching_entries = []
+    for entry in outbound_duplicates:
+        if entry["data"] == entry_data:
+            matching_entries.append(entry)
+    return matching_entries
+
+
+def set_status_to_confirmed(matching_entries, db_conn):
+    """Set the `status` of any matches to "CONFIRMED" if it's "UNCONFIRMED".
+
+    Args:
+        matching_entries:
+            list:   A list of user|role RethinkDB entries to modify.
+        db_conn:
+            obj:    An open RethinkDB connection object.
+    Returns:
+        update_response:
+            obj:    A dict containing the RethinkDB transaction response.
+    """
+    id_list = get_ids(matching_entries)
+    update_response = (
+        r.table("outbound_queue")
+        .get_all(id_list)
+        .update({"status": "CONFIRMED"})
+        .coerce_to("object")
+        .run(db_conn)
+    )
+    return update_response
+
+
+def delete_outbound_entries(matching_entries, db_conn):
+    """Delete the given entries from the DB.
+
+    Args:
+        matching_entries:
+            list:   A list of user|role RethinkDB entries to delete.
+        db_conn:
+            obj:    An open RethinkDB connection object.
+    Returns:
+        delete_response:
+            obj:    A dict containing the RethinkDB transaction response.
+    """
+    id_list = get_ids(matching_entries)
+    delete_response = (
+        r.table("outbound_queue")
+        .get_all(id_list)
+        .delete()
+        .coerce_to("object")
+        .run(db_conn)
+    )
+    return delete_response
+
+
+def get_ids(entries):
+    """Take in a list of entries and return a list of RethinkDB IDs.
+
+    Args:
+        entries:
+            list:   A list of dicts containing user|role RethinkDB entries.
+    Returns:
+        id_list:
+            list:   A list of RethinkDB UUIDs taken from `entries`
+    """
+    id_list = []
+    for entry in entries:
+        id_list.append(entry["id"])
+    return id_list
+
+
+def log_rethink_response(response, action):
+    """Process RethinkDB CRUD response and appropriately log the results.
+
+    Args:
+        response:
+            obj:    A dict containing a response from a rethinkDB operation.
+        action:
+            str:    The RethinkDB operation that was meant to be performed.
+                    ex: deleted|inserted|replaced
+    """
+    for key in response:
+        if key == action and response[key] > 0:
+            LOGGER.info("Successfully %s %s outbound entries.", key, response[key])
+        elif key != "error" and response[key] > 0:
+            LOGGER.warning("%s %s outbound entries.", key, response[key])
+        elif response[key] > 0:
+            LOGGER.error(
+                "%s %s occurred during rethink transaction.", response[key], key
+            )
