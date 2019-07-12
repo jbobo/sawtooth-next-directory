@@ -85,9 +85,17 @@ TEST_GROUPS = [{"common_name": "test_group", "name": "test_group"}]
 
 # entry_data, outbound_status, expected_result.
 TEST_CHECK_OUTBOUND_QUEUE = [
-    ({"data": {"name": "Test Entry 1", "remote_id": 1}}, "UNCONFIRMED", True),
-    ({"data": {"name": "Test Entry 2", "remote_id": 2}}, "CONFIRMED", True),
-    ({"data": {"name": "Test Entry 3", "remote_id": 3}}, None, False),
+    (
+        {"data": {"members": ["test_user_1"], "remote_id": "role_1"}},
+        "UNCONFIRMED",
+        True,
+    ),
+    (
+        {"data": {"members": ["test_user_1, test_user_2"], "remote_id": "role_2"}},
+        "CONFIRMED",
+        True,
+    ),
+    ({"data": {"members": ["test_user_3"], "remote_id": "role_3"}}, None, False),
 ]
 
 # ------------------------------------------------------------------------------
@@ -974,7 +982,7 @@ def test_outbound_queue_check(entry_data, outbound_status, expected_result):
 
     Args:
         entry_data:
-            obj:    A dict containing a valid NEXT user or role object. Only
+            obj:    A dict containing a valid NEXT role object. Only
                     the `whenChanged` key is directly called in this obj, so
                     the rest may be arbitrary for this test (update if needed).
         outbound_status:

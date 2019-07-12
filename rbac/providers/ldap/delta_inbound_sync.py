@@ -17,27 +17,28 @@
 import os
 import time
 from datetime import datetime, timezone
-import rethinkdb as r
-import ldap3
-from rbac.providers.common import ldap_connector
-from rbac.common.logs import get_default_logger
 
+import ldap3
+import rethinkdb as r
+
+from rbac.common.logs import get_default_logger
+from rbac.providers.common import ldap_connector
+from rbac.providers.common.db_queries import connect_to_db, save_sync_time
 from rbac.providers.common.inbound_filters import (
     inbound_user_filter,
     inbound_group_filter,
+    outbound_queue_filter,
 )
-from rbac.providers.common.db_queries import connect_to_db, save_sync_time
 
+DELTA_SYNC_INTERVAL_SECONDS = int(os.getenv("DELTA_SYNC_INTERVAL_SECONDS", "3600"))
+GROUP_BASE_DN = os.getenv("GROUP_BASE_DN")
 LDAP_DC = os.getenv("LDAP_DC")
+LDAP_SEARCH_PAGE_SIZE = 500
 LDAP_SERVER = os.getenv("LDAP_SERVER")
 LDAP_USER = os.getenv("LDAP_USER")
 LDAP_PASS = os.getenv("LDAP_PASS")
-USER_BASE_DN = os.getenv("USER_BASE_DN")
-GROUP_BASE_DN = os.getenv("GROUP_BASE_DN")
-DELTA_SYNC_INTERVAL_SECONDS = int(os.getenv("DELTA_SYNC_INTERVAL_SECONDS", "3600"))
-LDAP_SEARCH_PAGE_SIZE = 500
-
 LOGGER = get_default_logger(__name__)
+USER_BASE_DN = os.getenv("USER_BASE_DN")
 
 
 def fetch_ldap_changes():
@@ -108,7 +109,7 @@ def fetch_ldap_changes():
             if cookie:
                 search_parameters["paged_cookie"] = cookie
             else:
-                LOGGER.info("Imported %s entries from Active Directory", entry_count)
+                LOGGER.info("Found %s AD delta entries", entry_count)
                 break
     conn.close()
 
@@ -217,19 +218,17 @@ def insert_deleted_entries(deleted_entries, data_type):
     conn = connect_to_db()
     for remote_id in deleted_entries:
         data = {"remote_id": remote_id}
-        is_entry_a_duplicate = remove_outbound_duplicates(data, conn)
-        if not is_entry_a_duplicate:
-            inbound_entry = {
-                "data": data,
-                "data_type": data_type,
-                "sync_type": "delta",
-                "timestamp": datetime.now().replace(tzinfo=timezone.utc).isoformat(),
-                "provider_id": LDAP_DC,
-            }
-            LOGGER.debug(
-                "Inserted deleted LDAP %s into inbound queue: %s", data_type, remote_id
-            )
-            r.table("inbound_queue").insert(inbound_entry).run(conn)
+        inbound_entry = {
+            "data": data,
+            "data_type": data_type,
+            "sync_type": "delta",
+            "timestamp": datetime.now().replace(tzinfo=timezone.utc).isoformat(),
+            "provider_id": LDAP_DC,
+        }
+        LOGGER.debug(
+            "Inserted deleted LDAP %s into inbound queue: %s", data_type, remote_id
+        )
+        r.table("inbound_queue").insert(inbound_entry).run(conn)
     conn.close()
 
 
@@ -254,7 +253,11 @@ def insert_updated_entries(data_dict, when_changed, data_type):
                 "provider_id": LDAP_DC,
             }
 
-            is_entry_a_duplicate = remove_outbound_duplicates(standardized_entry, conn)
+            is_entry_a_duplicate = None
+            if data_type == "group":
+                is_entry_a_duplicate = remove_outbound_duplicates(
+                    standardized_entry, conn
+                )
             if not is_entry_a_duplicate:
                 LOGGER.debug(
                     "Inserting LDAP %s into inbound queue: %s",
@@ -262,13 +265,12 @@ def insert_updated_entries(data_dict, when_changed, data_type):
                     standardized_entry["remote_id"],
                 )
                 r.table("inbound_queue").insert(inbound_entry).run(conn)
-
-                sync_source = "ldap-" + data_type
-                provider_id = LDAP_DC
-                save_sync_time(
-                    provider_id, sync_source, "delta", conn, entry_modified_timestamp
-                )
                 insertion_counter += 1
+            sync_source = "ldap-" + data_type
+            provider_id = LDAP_DC
+            save_sync_time(
+                provider_id, sync_source, "delta", conn, entry_modified_timestamp
+            )
     conn.close()
     LOGGER.info("Inserted %s records into inbound_queue.", insertion_counter)
 
@@ -297,8 +299,8 @@ def remove_outbound_duplicates(entry_data, db_conn):
 
     Args:
         entry_data:
-            obj:    data field of a valid NEXT object. This field will contain either a
-                    full NEXT user dict, or a full NEXT role dict.
+            obj:    data field of a valid NEXT object. This field will contain the
+                    remote_id and members field of the NEXT role object.
         db_conn:
             obj: An open RethinkDB connection object.
     Returns:
@@ -320,8 +322,7 @@ def remove_outbound_duplicates(entry_data, db_conn):
         update_response = set_status_to_confirmed(matching_entries, db_conn)
         log_rethink_response(update_response, "updated")
 
-        delete_response = delete_outbound_entries(matching_entries, db_conn)
-        log_rethink_response(delete_response, "deleted")
+        delete_outbound_entries(matching_entries, db_conn)
 
         return True
 
@@ -334,13 +335,13 @@ def get_outbound_duplicates(remote_id, db_conn):
 
     Args:
         remote_id:
-            str:    The remote id of the user|role object used by the
+            str:    The remote id of the role object used by the
                     remote rbac provider.
         db_conn:
             obj:    An open RethinkDB connection object.
     Returns:
         outbound_duplicates:
-            list:   A list of RethinkDB user|group entries from the
+            list:   A list of RethinkDB group entries from the
                     outbound queue that have the given remote id.
     """
     outbound_duplicates = (
@@ -359,18 +360,31 @@ def get_matching_entries(entry_data, outbound_duplicates):
 
     Args:
         entry_data:
-            obj:    A dict containing a user|role RethnkDB entry.
-        outbound_suplicates:
-            list:   A list of user|role entries from RethinkDB representing
+            obj:    A dict containing a role RethinkDB entry.
+        outbound_duplicates:
+            list:   A list of role entries from RethinkDB representing
                     transactions performed on a single resource.
     Returns:
         matching_entries:
-            list:   A list of any user|role entries with a data field
+            list:   A list of any role entries with a data field
                     matching the given entry_data.
     """
+    filtered_entry_data = outbound_queue_filter(entry_data, "ldap")
     matching_entries = []
     for entry in outbound_duplicates:
-        if entry["data"] == entry_data:
+        entry_match = True
+        outbound_entry_data = entry["data"]
+        LOGGER.info("filtered data...")
+        LOGGER.info(filtered_entry_data)
+        LOGGER.info("outbound data...")
+        LOGGER.info(outbound_entry_data)
+        for attribute in outbound_entry_data:
+            if isinstance(entry_data[attribute], list):
+                outbound_entry_data[attribute].sort()
+                filtered_entry_data[attribute].sort()
+            if outbound_entry_data[attribute] != filtered_entry_data[attribute]:
+                entry_match = False
+        if entry_match:
             matching_entries.append(entry)
     return matching_entries
 
@@ -380,7 +394,7 @@ def set_status_to_confirmed(matching_entries, db_conn):
 
     Args:
         matching_entries:
-            list:   A list of user|role RethinkDB entries to modify.
+            list:   A list of role RethinkDB entries to modify.
         db_conn:
             obj:    An open RethinkDB connection object.
     Returns:
@@ -403,22 +417,15 @@ def delete_outbound_entries(matching_entries, db_conn):
 
     Args:
         matching_entries:
-            list:   A list of user|role RethinkDB entries to delete.
+            list:   A list of outbound_queue table entries to delete.
         db_conn:
             obj:    An open RethinkDB connection object.
-    Returns:
-        delete_response:
-            obj:    A dict containing the RethinkDB transaction response.
     """
     id_list = get_ids(matching_entries)
-    delete_response = (
-        r.table("outbound_queue")
-        .get_all(id_list)
-        .delete()
-        .coerce_to("object")
-        .run(db_conn)
-    )
-    return delete_response
+    for entry_id in id_list:
+        r.table("outbound_queue").get_all(entry_id).delete().coerce_to("object").run(
+            db_conn
+        )
 
 
 def get_ids(entries):
